@@ -20,7 +20,8 @@ from .detectors import Config, Finding, Severity
 from .parser import MONTHS
 
 LINE = re.compile(
-    r"^(?P<ip>[0-9a-fA-F.:]+) \S+ \S+ \[(?P<time>[^\]]+)\] "
+    # (?:host:puerto )? es el formato vhost_combined de Apache (other_vhosts_access.log)
+    r"^(?:\S+:\d+ )?(?P<ip>[0-9a-fA-F.:]+) \S+ \S+ \[(?P<time>[^\]]+)\] "
     r'"(?P<req>(?:[^"\\]|\\.)*)" (?P<status>\d{3}) (?P<size>\d+|-)'
     r'(?: "(?P<ref>(?:[^"\\]|\\.)*)" "(?P<ua>(?:[^"\\]|\\.)*)")?'
 )
@@ -116,6 +117,23 @@ SENSITIVE_PATHS = (
 )
 
 
+# Búsquedas de Log4j que sirven para ofuscar Log4Shell: ${lower:j}, ${upper:j}, ${::-j},
+# ${env:NO_EXISTE:-j}... Al resolverlas, "${${lower:j}ndi:" queda en "${jndi:".
+LOG4J_LOOKUP = re.compile(r"\$\{(?:(?:lower|upper):|[a-z]*:[^:{}$]*:-)([^{}$]*)\}")
+
+
+LOG_ESCAPE = re.compile(r"\\x([0-9a-fA-F]{2})|\\[\"\\]")
+
+
+def _resolve_log4j_lookups(text: str) -> str:
+    for _ in range(10):
+        resolved = LOG4J_LOOKUP.sub(r"\1", text)
+        if resolved == text:
+            break
+        text = resolved
+    return text
+
+
 def normalize(text: str) -> str:
     """Deja la petición como la acabaría viendo la aplicación, para buscar firmas en ella.
 
@@ -124,12 +142,16 @@ def normalize(text: str) -> str:
     - El '+' de la query string es un espacio: ?id=1+union+select.
     - Los comentarios SQL /**/ hacen de espacio: union/**/select.
     """
+    # nginx escribe los bytes raros y las comillas como \xHH y Apache como \" en el log.
+    text = LOG_ESCAPE.sub(lambda m: chr(int(m[1], 16)) if m[1] else m[0][1], text)
     for _ in range(3):
         decoded = unquote_plus(text)
         if decoded == text:
             break
         text = decoded
     text = text.lower().replace("/**/", " ")
+    if "${" in text:
+        text = _resolve_log4j_lookups(text)
     return " ".join(text.split())
 
 
@@ -234,6 +256,10 @@ def _signature_findings(events: list[WebEvent]) -> list[Finding]:
     return findings
 
 
+def _is_sensitive(path: str) -> bool:
+    return any(s in path for s in SENSITIVE_PATHS)
+
+
 def _scanner_findings(events: list[WebEvent], cfg: Config) -> list[Finding]:
     by_ip: dict[str, list[WebEvent]] = defaultdict(list)
     for event in events:
@@ -241,7 +267,10 @@ def _scanner_findings(events: list[WebEvent], cfg: Config) -> list[Finding]:
 
     findings = []
     for ip, evs in by_ip.items():
-        sensitive = {e.path for e in evs if any(s in normalize(e.path) for s in SENSITIVE_PATHS)}
+        # normalize() una vez por petición, no una vez por cada ruta sensible
+        # (sin la query: /wp-admin?x=1 y ?x=2 son la misma ruta, y ?q=/.env no es pedir /.env)
+        paths = {normalize(e.path.split("?", 1)[0]) for e in evs}
+        sensitive = {p for p in paths if _is_sensitive(p)}
         not_found = {e.path for e in evs if e.status == 404}
         if len(sensitive) >= cfg.web_scanner_min_sensitive:
             sample = ", ".join(sorted(sensitive)[:5])
